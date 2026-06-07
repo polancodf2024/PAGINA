@@ -654,7 +654,7 @@ with st.sidebar:
 # HEADER
 # ============================================================
 st.markdown("# Biblioteca de Ciencia Ficción")
-st.markdown("### *Relatos del espacio y la consciencia*")
+#st.markdown("### *Relatos de Ciencia ficció*")
 
 # ============================================================
 # BIBLIOTECA
