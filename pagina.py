@@ -40,74 +40,94 @@ CSV_LECTURAS_FILE = st.secrets["csv_lecturas_file"]
 # ============================================================
 # FUNCIONES DE CONEXIÓN REMOTA
 # ============================================================
-@st.cache_resource
-def get_ssh_connection():
-    """Establece conexión SSH con el servidor remoto (con caché)"""
-    try:
-        ssh = SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            hostname=REMOTE_CONFIG["host"],
-            port=REMOTE_CONFIG["port"],
-            username=REMOTE_CONFIG["user"],
-            password=REMOTE_CONFIG["password"],
-            timeout=15
-        )
-        return ssh
-    except Exception as e:
-        st.error(f"❌ Error de conexión remota: {str(e)}")
+class SSHConnectionManager:
+    """Administrador de conexión SSH para mantener la conexión activa"""
+    def __init__(self):
+        self.ssh = None
+        
+    def get_connection(self):
+        """Obtiene o crea una conexión SSH"""
+        if self.ssh is None:
+            try:
+                self.ssh = SSHClient()
+                self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                self.ssh.connect(
+                    hostname=REMOTE_CONFIG["host"],
+                    port=REMOTE_CONFIG["port"],
+                    username=REMOTE_CONFIG["user"],
+                    password=REMOTE_CONFIG["password"],
+                    timeout=30
+                )
+                return self.ssh
+            except Exception as e:
+                st.error(f"❌ Error de conexión remota: {str(e)}")
+                return None
+        return self.ssh
+    
+    def get_sftp(self):
+        """Obtiene una conexión SFTP desde la conexión SSH activa"""
+        ssh = self.get_connection()
+        if ssh:
+            try:
+                return ssh.open_sftp()
+            except Exception as e:
+                st.error(f"❌ Error al abrir SFTP: {str(e)}")
+                return None
         return None
+    
+    def close(self):
+        """Cierra la conexión SSH"""
+        if self.ssh:
+            self.ssh.close()
+            self.ssh = None
+
+# Crear instancia global del manejador de conexión
+ssh_manager = SSHConnectionManager()
 
 def get_sftp():
     """Obtiene una conexión SFTP"""
-    ssh = get_ssh_connection()
-    if ssh:
-        try:
-            return ssh.open_sftp()
-        except Exception as e:
-            st.error(f"❌ Error al abrir SFTP: {str(e)}")
-            return None
-    return None
+    return ssh_manager.get_sftp()
 
 # ============================================================
 # FUNCIONES PARA LEER/ESCRIBIR CSV REMOTOS
 # ============================================================
 def leer_csv_remoto(nombre_archivo):
     """Lee un CSV desde el servidor remoto y retorna lista de diccionarios"""
-    sftp = get_sftp()
-    if not sftp:
-        return []
-    
-    remote_path = f"{REMOTE_CONFIG['remote_dir']}/{nombre_archivo}"
-    
     try:
-        with sftp.open(remote_path, 'r') as f:
-            content = f.read().decode('utf-8')
-        sftp.close()
-        
-        if not content:
+        sftp = get_sftp()
+        if not sftp:
             return []
         
-        reader = csv.DictReader(io.StringIO(content))
-        return list(reader)
-    
-    except FileNotFoundError:
-        sftp.close()
-        return []
+        remote_path = f"{REMOTE_CONFIG['remote_dir']}/{nombre_archivo}"
+        
+        try:
+            with sftp.open(remote_path, 'r') as f:
+                content = f.read().decode('utf-8')
+            
+            if not content:
+                return []
+            
+            reader = csv.DictReader(io.StringIO(content))
+            return list(reader)
+        
+        except FileNotFoundError:
+            return []
+        except Exception as e:
+            st.error(f"Error al leer {nombre_archivo}: {str(e)}")
+            return []
     except Exception as e:
-        sftp.close()
-        st.error(f"Error al leer {nombre_archivo}: {str(e)}")
+        st.error(f"Error general en leer_csv_remoto: {str(e)}")
         return []
 
 def escribir_csv_remoto(nombre_archivo, datos, campos):
     """Escribe un CSV en el servidor remoto"""
-    sftp = get_sftp()
-    if not sftp:
-        return False
-    
-    remote_path = f"{REMOTE_CONFIG['remote_dir']}/{nombre_archivo}"
-    
     try:
+        sftp = get_sftp()
+        if not sftp:
+            return False
+        
+        remote_path = f"{REMOTE_CONFIG['remote_dir']}/{nombre_archivo}"
+        
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=campos)
         writer.writeheader()
@@ -116,11 +136,9 @@ def escribir_csv_remoto(nombre_archivo, datos, campos):
         with sftp.open(remote_path, 'w') as f:
             f.write(output.getvalue())
         
-        sftp.close()
         return True
     
     except Exception as e:
-        sftp.close()
         st.error(f"Error al escribir {nombre_archivo}: {str(e)}")
         return False
 
@@ -207,34 +225,31 @@ def obtener_todos_registros():
 
 def descargar_pdf_remoto(archivo_pdf):
     """Descarga un PDF directamente del servidor remoto"""
-    sftp = get_sftp()
-    if not sftp:
-        return None
-    
-    remote_path = f"{REMOTE_CONFIG['remote_dir']}/{archivo_pdf}"
-    
     try:
+        sftp = get_sftp()
+        if not sftp:
+            return None
+        
+        remote_path = f"{REMOTE_CONFIG['remote_dir']}/{archivo_pdf}"
+        
         with sftp.open(remote_path, 'rb') as f:
             pdf_bytes = f.read()
-        sftp.close()
+        
         return pdf_bytes
     except Exception as e:
         st.error(f"Error al descargar PDF: {str(e)}")
-        sftp.close()
         return None
 
 def listar_pdfs_remotos():
     """Lista todos los archivos PDF en el directorio remoto"""
-    sftp = get_sftp()
-    if not sftp:
-        return []
-    
     try:
+        sftp = get_sftp()
+        if not sftp:
+            return []
+        
         files = sftp.listdir(REMOTE_CONFIG["remote_dir"])
-        sftp.close()
         return [f for f in files if f.lower().endswith('.pdf')]
     except Exception as e:
-        sftp.close()
         st.error(f"Error al listar PDFs: {str(e)}")
         return []
 
@@ -595,31 +610,34 @@ st.markdown("""
 # ============================================================
 def inicializar_csvs_remotos():
     """Inicializa los archivos CSV en el servidor remoto si no existen"""
-    sftp = get_sftp()
-    if not sftp:
-        return
-    
-    libros_path = f"{REMOTE_CONFIG['remote_dir']}/{CSV_LIBROS_FILE}"
-    lecturas_path = f"{REMOTE_CONFIG['remote_dir']}/{CSV_LECTURAS_FILE}"
-    
     try:
-        sftp.stat(libros_path)
-    except FileNotFoundError:
-        with sftp.open(libros_path, 'w') as f:
-            f.write('id,titulo,autor,año,archivo_pdf,abstract\n')
+        sftp = get_sftp()
+        if not sftp:
+            return
+        
+        libros_path = f"{REMOTE_CONFIG['remote_dir']}/{CSV_LIBROS_FILE}"
+        lecturas_path = f"{REMOTE_CONFIG['remote_dir']}/{CSV_LECTURAS_FILE}"
+        
+        try:
+            sftp.stat(libros_path)
+        except FileNotFoundError:
+            with sftp.open(libros_path, 'w') as f:
+                f.write('id,titulo,autor,año,archivo_pdf,abstract\n')
+        
+        try:
+            sftp.stat(lecturas_path)
+        except FileNotFoundError:
+            with sftp.open(lecturas_path, 'w') as f:
+                f.write('id_libro,email,fecha,ip,exito\n')
     
-    try:
-        sftp.stat(lecturas_path)
-    except FileNotFoundError:
-        with sftp.open(lecturas_path, 'w') as f:
-            f.write('id_libro,email,fecha,ip,exito\n')
-    
-    sftp.close()
+    except Exception as e:
+        st.error(f"Error al inicializar archivos remotos: {e}")
 
+# Intentar inicializar los CSVs remotos
 try:
     inicializar_csvs_remotos()
 except Exception as e:
-    st.error(f"Error al inicializar archivos remotos: {e}")
+    st.error(f"Error de inicialización: {e}")
 
 # ============================================================
 # SIDEBAR
