@@ -12,21 +12,6 @@ import os
 import tempfile
 import re
 from PIL import Image
-import webbrowser
-import threading
-import time
-
-# ============================================================
-# ABRIR NAVEGADOR AUTOMÁTICAMENTE (solo en ejecución local)
-# ============================================================
-def abrir_navegador():
-    """Abre el navegador automáticamente después de un breve retraso"""
-    time.sleep(1.5)
-    webbrowser.open('http://localhost:8501')
-
-# Verificar si está en ejecución local (no en Streamlit Cloud)
-if not os.environ.get('STREAMLIT_CLOUD', False):
-    threading.Thread(target=abrir_navegador, daemon=True).start()
 
 # ============================================================
 # CONFIGURACIÓN DESDE SECRETS
@@ -158,9 +143,15 @@ def cargar_libros_desde_csv():
             with open(CSV_LIBROS_FILE, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    row['id'] = int(row['id'])
-                    row['año'] = int(row['año'])
-                    libros.append(row)
+                    # Verificar que la fila tenga datos válidos
+                    if row.get('id') and row.get('id').strip():
+                        try:
+                            row['id'] = int(row['id'])
+                            row['año'] = int(row['año']) if row.get('año') and row['año'].strip() else 0
+                            libros.append(row)
+                        except ValueError:
+                            print(f"⚠️ Fila con ID inválido ignorada: {row.get('id')}")
+                            continue
     except Exception as e:
         st.error(f"Error al cargar libros: {str(e)}")
     return libros
@@ -220,8 +211,12 @@ def verificar_descarga_previa(id_libro, email):
             with open(CSV_LECTURAS_FILE, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    if int(row['id_libro']) == id_libro and row['email'] == email and row['exito'] == 'True':
-                        return True
+                    if row.get('id_libro') and row.get('email'):
+                        try:
+                            if int(row['id_libro']) == id_libro and row['email'] == email and row.get('exito') == 'True':
+                                return True
+                        except ValueError:
+                            continue
         return False
     except:
         return False
@@ -234,8 +229,12 @@ def obtener_estadisticas_libro(id_libro):
             with open(CSV_LECTURAS_FILE, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    if int(row['id_libro']) == id_libro and row['exito'] == 'True':
-                        count += 1
+                    if row.get('id_libro') and row.get('exito'):
+                        try:
+                            if int(row['id_libro']) == id_libro and row['exito'] == 'True':
+                                count += 1
+                        except ValueError:
+                            continue
         return count
     except:
         return 0
@@ -248,7 +247,9 @@ def obtener_todos_registros():
             with open(CSV_LECTURAS_FILE, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    registros.append(row)
+                    # Filtrar filas vacías o inválidas
+                    if row.get('id_libro') and row.get('id_libro').strip():
+                        registros.append(row)
     except:
         pass
     return registros
@@ -501,6 +502,7 @@ if opcion == "Biblioteca":
     if not libros:
         st.info("No hay libros disponibles. Usa 'Sincronizar' para cargar los libros desde el servidor remoto.")
     else:
+        # Mostrar cada libro una sola vez
         for libro in libros:
             key_abstract = f"show_abstract_{libro['id']}"
             if key_abstract not in st.session_state:
@@ -571,8 +573,11 @@ elif opcion == "Admin":
     with tab2:
         registros = obtener_todos_registros()
         st.write(f"**Total descargas:** {len(registros)}")
-        for reg in registros[-20:]:
-            st.markdown(f"- {reg['fecha']} - {reg['email']} - Libro ID: {reg['id_libro']}")
+        if registros:
+            for reg in registros[-20:]:
+                st.markdown(f"- {reg['fecha']} - {reg['email']} - Libro ID: {reg['id_libro']}")
+        else:
+            st.info("No hay registros de descargas aún.")
 
 # ============================================================
 # FOOTER
