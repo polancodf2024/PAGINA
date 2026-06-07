@@ -1,6 +1,5 @@
 import streamlit as st
 from datetime import datetime
-import base64
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -8,19 +7,21 @@ from email.mime.application import MIMEApplication
 import paramiko
 from paramiko import SSHClient
 import csv
-import os
-import tempfile
+import io
 import re
 from PIL import Image
 
 # ============================================================
 # CONFIGURACIÓN DESDE SECRETS
 # ============================================================
+# Limpiar espacios en la contraseña de Gmail si existen
+gmail_password = st.secrets["email_password"].replace(" ", "")
+
 EMAIL_CONFIG = {
     "smtp_server": st.secrets["smtp_server"],
     "smtp_port": int(st.secrets["smtp_port"]),
     "remitente": st.secrets["email_user"],
-    "password": st.secrets["email_password"],
+    "password": gmail_password,
     "notificacion": st.secrets["notification_email"]
 }
 
@@ -38,8 +39,9 @@ CSV_LECTURAS_FILE = st.secrets["csv_lecturas_file"]
 # ============================================================
 # FUNCIONES DE CONEXIÓN REMOTA
 # ============================================================
-def connect_sftp():
-    """Establece conexión SFTP con el servidor remoto"""
+@st.cache_resource
+def get_ssh_connection():
+    """Establece conexión SSH con el servidor remoto (con caché)"""
     try:
         ssh = SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -48,344 +50,213 @@ def connect_sftp():
             port=REMOTE_CONFIG["port"],
             username=REMOTE_CONFIG["user"],
             password=REMOTE_CONFIG["password"],
-            timeout=10
+            timeout=15
         )
         return ssh
     except Exception as e:
-        st.error(f"Error de conexión remota: {str(e)}")
+        st.error(f"❌ Error de conexión remota: {str(e)}")
         return None
 
-# ============================================================
-# INICIALIZACIÓN DE CSVs (LOCAL Y REMOTO)
-# ============================================================
-def inicializar_csvs():
-    """Inicializa los archivos CSV localmente y en el servidor remoto si no existen"""
-    
-    # === INICIALIZACIÓN LOCAL ===
-    if not os.path.exists(CSV_LIBROS_FILE):
-        with open(CSV_LIBROS_FILE, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['id', 'titulo', 'autor', 'año', 'sinopsis', 'archivo_pdf', 'abstract'])
-        print(f"✅ Archivo local creado: {CSV_LIBROS_FILE}")
-    
-    if not os.path.exists(CSV_LECTURAS_FILE):
-        with open(CSV_LECTURAS_FILE, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['id_libro', 'email', 'fecha', 'ip', 'exito'])
-        print(f"✅ Archivo local creado: {CSV_LECTURAS_FILE}")
-    
-    # === INICIALIZACIÓN EN SERVIDOR REMOTO ===
-    try:
-        ssh = connect_sftp()
-        if ssh:
-            sftp = ssh.open_sftp()
-            
-            # Verificar/Crear directorio remoto
-            try:
-                sftp.stat(REMOTE_CONFIG["remote_dir"])
-                print(f"✅ Directorio remoto existe: {REMOTE_CONFIG['remote_dir']}")
-            except FileNotFoundError:
-                try:
-                    # Crear directorio y subdirectorios necesarios
-                    current_path = ""
-                    for part in REMOTE_CONFIG["remote_dir"].strip('/').split('/'):
-                        current_path += "/" + part
-                        try:
-                            sftp.stat(current_path)
-                        except FileNotFoundError:
-                            sftp.mkdir(current_path)
-                            print(f"📁 Directorio creado: {current_path}")
-                except Exception as e:
-                    print(f"⚠️ No se pudo crear directorio remoto: {e}")
-            
-            # Archivos CSV remotos
-            remote_csv_libros = os.path.join(REMOTE_CONFIG["remote_dir"], CSV_LIBROS_FILE)
-            remote_csv_lecturas = os.path.join(REMOTE_CONFIG["remote_dir"], CSV_LECTURAS_FILE)
-            
-            # Crear CSV de libros remoto
-            try:
-                sftp.stat(remote_csv_libros)
-            except FileNotFoundError:
-                with tempfile.NamedTemporaryFile(mode='w', newline='', encoding='utf-8', delete=False) as tmp:
-                    writer = csv.writer(tmp)
-                    writer.writerow(['id', 'titulo', 'autor', 'año', 'sinopsis', 'archivo_pdf', 'abstract'])
-                    tmp_path = tmp.name
-                sftp.put(tmp_path, remote_csv_libros)
-                os.unlink(tmp_path)
-                print(f"📄 Archivo remoto creado: {remote_csv_libros}")
-            
-            # Crear CSV de lecturas remoto
-            try:
-                sftp.stat(remote_csv_lecturas)
-            except FileNotFoundError:
-                with tempfile.NamedTemporaryFile(mode='w', newline='', encoding='utf-8', delete=False) as tmp:
-                    writer = csv.writer(tmp)
-                    writer.writerow(['id_libro', 'email', 'fecha', 'ip', 'exito'])
-                    tmp_path = tmp.name
-                sftp.put(tmp_path, remote_csv_lecturas)
-                os.unlink(tmp_path)
-                print(f"📄 Archivo remoto creado: {remote_csv_lecturas}")
-            
-            sftp.close()
-            ssh.close()
-            print("✅ Inicialización remota completada")
-    except Exception as e:
-        print(f"⚠️ Error al inicializar archivos remotos: {e}")
+def get_sftp():
+    """Obtiene una conexión SFTP"""
+    ssh = get_ssh_connection()
+    if ssh:
+        try:
+            return ssh.open_sftp()
+        except Exception as e:
+            st.error(f"❌ Error al abrir SFTP: {str(e)}")
+            return None
+    return None
 
 # ============================================================
-# FUNCIONES DE MANEJO DE CSV
+# FUNCIONES PARA LEER/ESCRIBIR CSV REMOTOS
 # ============================================================
-def cargar_libros_desde_csv():
-    """Carga los libros desde el CSV local"""
-    libros = []
+def leer_csv_remoto(nombre_archivo):
+    """Lee un CSV desde el servidor remoto y retorna lista de diccionarios"""
+    sftp = get_sftp()
+    if not sftp:
+        return []
+    
+    remote_path = f"{REMOTE_CONFIG['remote_dir']}/{nombre_archivo}"
+    
     try:
-        if os.path.exists(CSV_LIBROS_FILE):
-            with open(CSV_LIBROS_FILE, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    # Verificar que la fila tenga datos válidos
-                    if row.get('id') and row.get('id').strip():
-                        try:
-                            row['id'] = int(row['id'])
-                            row['año'] = int(row['año']) if row.get('año') and row['año'].strip() else 0
-                            libros.append(row)
-                        except ValueError:
-                            print(f"⚠️ Fila con ID inválido ignorada: {row.get('id')}")
-                            continue
+        with sftp.open(remote_path, 'r') as f:
+            content = f.read().decode('utf-8')
+        sftp.close()
+        
+        if not content:
+            return []
+        
+        reader = csv.DictReader(io.StringIO(content))
+        return list(reader)
+    
+    except FileNotFoundError:
+        sftp.close()
+        return []
     except Exception as e:
-        st.error(f"Error al cargar libros: {str(e)}")
+        sftp.close()
+        st.error(f"Error al leer {nombre_archivo}: {str(e)}")
+        return []
+
+def escribir_csv_remoto(nombre_archivo, datos, campos):
+    """Escribe un CSV en el servidor remoto"""
+    sftp = get_sftp()
+    if not sftp:
+        return False
+    
+    remote_path = f"{REMOTE_CONFIG['remote_dir']}/{nombre_archivo}"
+    
+    try:
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=campos)
+        writer.writeheader()
+        writer.writerows(datos)
+        
+        with sftp.open(remote_path, 'w') as f:
+            f.write(output.getvalue())
+        
+        sftp.close()
+        return True
+    
+    except Exception as e:
+        sftp.close()
+        st.error(f"Error al escribir {nombre_archivo}: {str(e)}")
+        return False
+
+def agregar_fila_csv_remoto(nombre_archivo, nueva_fila, campos):
+    """Agrega una fila a un CSV remoto"""
+    datos = leer_csv_remoto(nombre_archivo)
+    datos.append(nueva_fila)
+    return escribir_csv_remoto(nombre_archivo, datos, campos)
+
+# ============================================================
+# FUNCIONES DE NEGOCIO
+# ============================================================
+def cargar_libros():
+    """Carga los libros directamente desde el CSV remoto"""
+    libros_raw = leer_csv_remoto(CSV_LIBROS_FILE)
+    
+    libros = []
+    for row in libros_raw:
+        if row.get('id') and row['id'].strip().isdigit():
+            titulo = row.get('titulo', '').strip()
+            if titulo and len(titulo) > 2:
+                try:
+                    libro = {
+                        'id': int(row['id']),
+                        'titulo': titulo,
+                        'autor': row.get('autor', 'Autor desconocido').strip(),
+                        'año': int(row['año']) if row.get('año') and row['año'].strip().isdigit() else 2026,
+                        'archivo_pdf': row.get('archivo_pdf', '').strip(),
+                        'abstract': row.get('abstract', 'Sin descripción disponible.').strip()
+                    }
+                    libros.append(libro)
+                except ValueError:
+                    continue
+    
+    libros.sort(key=lambda x: x['id'])
     return libros
 
-def guardar_libro_en_csv(libro_data):
-    """Guarda un nuevo libro en el CSV"""
-    try:
-        libros = cargar_libros_desde_csv()
-        
-        if len(libros) == 0:
-            nuevo_id = 1
-        else:
-            nuevo_id = max(libro['id'] for libro in libros) + 1
-        
-        libro_data['id'] = nuevo_id
-        
-        with open(CSV_LIBROS_FILE, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                libro_data['id'],
-                libro_data['titulo'],
-                libro_data['autor'],
-                libro_data['año'],
-                libro_data['sinopsis'],
-                libro_data['archivo_pdf'],
-                libro_data['abstract']
-            ])
-        
-        return nuevo_id
-    except Exception as e:
-        st.error(f"Error al guardar libro: {str(e)}")
-        return None
-
 def registrar_descarga(id_libro, email, exito=True):
-    """Registra una descarga en el CSV de lecturas"""
-    try:
-        with open(CSV_LECTURAS_FILE, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                id_libro,
-                email,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'local',
-                exito
-            ])
-        
-        enviar_notificacion_autor(id_libro, email, exito)
-        return True
-    except Exception as e:
-        print(f"Error al registrar descarga: {str(e)}")
-        return False
+    """Registra una descarga en el CSV de lecturas remoto"""
+    nueva_descarga = {
+        'id_libro': str(id_libro),
+        'email': email,
+        'fecha': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'ip': 'web',
+        'exito': str(exito)
+    }
+    
+    campos = ['id_libro', 'email', 'fecha', 'ip', 'exito']
+    return agregar_fila_csv_remoto(CSV_LECTURAS_FILE, nueva_descarga, campos)
 
 def verificar_descarga_previa(id_libro, email):
     """Verifica si un usuario ya ha descargado un libro antes"""
-    try:
-        if os.path.exists(CSV_LECTURAS_FILE):
-            with open(CSV_LECTURAS_FILE, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if row.get('id_libro') and row.get('email'):
-                        try:
-                            if int(row['id_libro']) == id_libro and row['email'] == email and row.get('exito') == 'True':
-                                return True
-                        except ValueError:
-                            continue
-        return False
-    except:
-        return False
+    descargas = leer_csv_remoto(CSV_LECTURAS_FILE)
+    
+    for descarga in descargas:
+        try:
+            if (descarga.get('id_libro') and 
+                descarga.get('email') and 
+                descarga.get('exito') == 'True'):
+                if int(descarga['id_libro']) == id_libro and descarga['email'] == email:
+                    return True
+        except (ValueError, TypeError):
+            continue
+    return False
 
 def obtener_estadisticas_libro(id_libro):
-    """Obtiene estadísticas de descargas para un libro"""
-    try:
-        count = 0
-        if os.path.exists(CSV_LECTURAS_FILE):
-            with open(CSV_LECTURAS_FILE, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if row.get('id_libro') and row.get('exito'):
-                        try:
-                            if int(row['id_libro']) == id_libro and row['exito'] == 'True':
-                                count += 1
-                        except ValueError:
-                            continue
-        return count
-    except:
-        return 0
+    """Obtiene estadísticas de descargas exitosas para un libro"""
+    descargas = leer_csv_remoto(CSV_LECTURAS_FILE)
+    
+    count = 0
+    for descarga in descargas:
+        try:
+            if (descarga.get('id_libro') and 
+                descarga.get('exito') == 'True'):
+                if int(descarga['id_libro']) == id_libro:
+                    count += 1
+        except (ValueError, TypeError):
+            continue
+    return count
 
 def obtener_todos_registros():
     """Obtiene todos los registros de descargas"""
-    registros = []
-    try:
-        if os.path.exists(CSV_LECTURAS_FILE):
-            with open(CSV_LECTURAS_FILE, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    # Filtrar filas vacías o inválidas
-                    if row.get('id_libro') and row.get('id_libro').strip():
-                        registros.append(row)
-    except:
-        pass
-    return registros
-
-# ============================================================
-# FUNCIONES DE SINCRONIZACIÓN Y DESCARGA
-# ============================================================
-def sincronizar_libros_remotos():
-    """Sincroniza los libros del servidor remoto con el CSV local"""
-    ssh = connect_sftp()
-    if not ssh:
-        return False, "No se pudo conectar al servidor remoto"
-    
-    try:
-        sftp = ssh.open_sftp()
-        
-        try:
-            files = sftp.listdir(REMOTE_CONFIG["remote_dir"])
-            pdfs_remotos = [f for f in files if f.lower().endswith('.pdf')]
-        except FileNotFoundError:
-            return False, f"Directorio remoto no encontrado: {REMOTE_CONFIG['remote_dir']}"
-        
-        libros_existentes = cargar_libros_desde_csv()
-        archivos_existentes = [libro['archivo_pdf'] for libro in libros_existentes]
-        
-        nuevos_libros = 0
-        for pdf_file in pdfs_remotos:
-            if pdf_file in archivos_existentes:
-                continue
-            
-            nombre_sin_pdf = pdf_file.replace('.pdf', '')
-            match = re.match(r'^(\d+)_(.+)$', nombre_sin_pdf)
-            if match:
-                titulo = match.group(2).replace('_', ' ')
-            else:
-                titulo = nombre_sin_pdf.replace('_', ' ')
-            
-            nuevo_libro = {
-                'id': None,
-                'titulo': titulo,
-                'autor': 'Por determinar',
-                'año': datetime.now().year,
-                'sinopsis': f'Sinopsis no disponible para "{titulo}".',
-                'archivo_pdf': pdf_file,
-                'abstract': f'Abstract no disponible. Contenido: {titulo}'
-            }
-            guardar_libro_en_csv(nuevo_libro)
-            nuevos_libros += 1
-        
-        sftp.close()
-        ssh.close()
-        
-        return True, f"Sincronización completada. {nuevos_libros} libros nuevos agregados."
-    
-    except Exception as e:
-        return False, f"Error en sincronización: {str(e)}"
+    return leer_csv_remoto(CSV_LECTURAS_FILE)
 
 def descargar_pdf_remoto(archivo_pdf):
-    """Descarga un PDF del servidor remoto"""
-    ssh = connect_sftp()
-    if not ssh:
+    """Descarga un PDF directamente del servidor remoto"""
+    sftp = get_sftp()
+    if not sftp:
         return None
+    
+    remote_path = f"{REMOTE_CONFIG['remote_dir']}/{archivo_pdf}"
     
     try:
-        sftp = ssh.open_sftp()
-        remote_path = os.path.join(REMOTE_CONFIG["remote_dir"], archivo_pdf)
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            sftp.get(remote_path, tmp_file.name)
-            with open(tmp_file.name, 'rb') as f:
-                pdf_bytes = f.read()
-            os.unlink(tmp_file.name)
-        
+        with sftp.open(remote_path, 'rb') as f:
+            pdf_bytes = f.read()
         sftp.close()
-        ssh.close()
         return pdf_bytes
-    
     except Exception as e:
         st.error(f"Error al descargar PDF: {str(e)}")
+        sftp.close()
         return None
+
+def listar_pdfs_remotos():
+    """Lista todos los archivos PDF en el directorio remoto"""
+    sftp = get_sftp()
+    if not sftp:
+        return []
+    
+    try:
+        files = sftp.listdir(REMOTE_CONFIG["remote_dir"])
+        sftp.close()
+        return [f for f in files if f.lower().endswith('.pdf')]
+    except Exception as e:
+        sftp.close()
+        st.error(f"Error al listar PDFs: {str(e)}")
+        return []
 
 # ============================================================
 # FUNCIONES DE EMAIL
 # ============================================================
-def enviar_notificacion_autor(id_libro, email_usuario, exito):
-    """Envía notificación al autor sobre descargas"""
-    try:
-        libros = cargar_libros_desde_csv()
-        titulo_libro = "Desconocido"
-        for libro in libros:
-            if libro['id'] == id_libro:
-                titulo_libro = libro['titulo']
-                break
-        
-        msg = MIMEMultipart()
-        msg['From'] = EMAIL_CONFIG["remitente"]
-        msg['To'] = EMAIL_CONFIG["notificacion"]
-        msg['Subject'] = f"Nueva descarga - {titulo_libro}"
-        
-        estado = "EXITOSA" if exito else "FALLIDA"
-        cuerpo = f"""
-        Nueva solicitud de libro registrada:
-        
-        📚 Libro: {titulo_libro} (ID: {id_libro})
-        📧 Solicitante: {email_usuario}
-        ✅ Estado: {estado}
-        🕐 Fecha: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-        """
-        
-        msg.attach(MIMEText(cuerpo, 'plain', 'utf-8'))
-        
-        with smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]) as server:
-            server.starttls()
-            server.login(EMAIL_CONFIG["remitente"], EMAIL_CONFIG["password"])
-            server.send_message(msg)
-        
-        return True
-    except Exception as e:
-        print(f"Error en notificación: {str(e)}")
-        return False
-
 def enviar_pdf_por_email(email_destino, id_libro, archivo_pdf, titulo_libro):
     """Envía el PDF por email al usuario"""
     try:
         if verificar_descarga_previa(id_libro, email_destino):
             return False, "Ya has descargado este libro anteriormente. Revisa tu correo."
         
-        pdf_bytes = descargar_pdf_remoto(archivo_pdf)
+        if not email_destino or "@" not in email_destino or "." not in email_destino:
+            return False, "Por favor, ingresa un correo electrónico válido."
         
+        pdf_bytes = descargar_pdf_remoto(archivo_pdf)
         if not pdf_bytes:
             return False, "No se pudo descargar el PDF del servidor remoto."
         
         msg = MIMEMultipart()
         msg['From'] = EMAIL_CONFIG["remitente"]
         msg['To'] = email_destino
-        msg['Subject'] = f"Tu libro: {titulo_libro}"
+        msg['Subject'] = f"📚 Tu libro: {titulo_libro}"
         
         cuerpo = f"""Estimado lector,
 
@@ -393,9 +264,9 @@ Gracias por tu interés en "{titulo_libro}".
 
 Adjunto encontrarás el archivo PDF para que disfrutes de la lectura.
 
-Saludos desde el espacio,
+Saludos,
+Carlos Polanco
 
-El autor
 ---
 Si no solicitaste este libro, ignora este mensaje."""
         
@@ -412,11 +283,68 @@ Si no solicitaste este libro, ignora este mensaje."""
         
         registrar_descarga(id_libro, email_destino, exito=True)
         
-        return True, "PDF enviado a tu correo electrónico. ¡Disfruta la lectura!"
+        return True, "✅ PDF enviado a tu correo. ¡Disfruta la lectura!"
     
+    except smtplib.SMTPAuthenticationError:
+        registrar_descarga(id_libro, email_destino, exito=False)
+        return False, "Error de autenticación con Gmail. Contacta al administrador."
+    except smtplib.SMTPRecipientsRefused:
+        registrar_descarga(id_libro, email_destino, exito=False)
+        return False, f"❌ El correo '{email_destino}' no es válido."
     except Exception as e:
         registrar_descarga(id_libro, email_destino, exito=False)
-        return False, f"Error al enviar: {str(e)}"
+        return False, f"Error: {str(e)}"
+
+# ============================================================
+# FUNCIONES DE ADMINISTRACIÓN
+# ============================================================
+def sincronizar_pdfs_a_csv():
+    """Sincroniza los PDFs del directorio con el CSV de libros"""
+    pdfs = listar_pdfs_remotos()
+    
+    if not pdfs:
+        return False, "No se encontraron archivos PDF en el servidor remoto."
+    
+    libros_existentes = cargar_libros()
+    archivos_existentes = [libro['archivo_pdf'] for libro in libros_existentes]
+    
+    libros_data = leer_csv_remoto(CSV_LIBROS_FILE)
+    
+    nuevos = 0
+    for pdf_file in pdfs:
+        if pdf_file not in archivos_existentes:
+            max_id = 0
+            for libro in libros_data:
+                try:
+                    if libro.get('id') and libro['id'].isdigit():
+                        max_id = max(max_id, int(libro['id']))
+                except:
+                    pass
+            
+            nuevo_id = max_id + 1
+            
+            nombre_sin_pdf = pdf_file.replace('.pdf', '')
+            titulo = nombre_sin_pdf.replace('_', ' ').replace('.', ' ')
+            
+            nuevo_libro = {
+                'id': str(nuevo_id),
+                'titulo': titulo,
+                'autor': 'Por determinar',
+                'año': str(datetime.now().year),
+                'archivo_pdf': pdf_file,
+                'abstract': f'Descripción no disponible para "{titulo}".'
+            }
+            libros_data.append(nuevo_libro)
+            nuevos += 1
+    
+    if nuevos > 0:
+        campos = ['id', 'titulo', 'autor', 'año', 'archivo_pdf', 'abstract']
+        if escribir_csv_remoto(CSV_LIBROS_FILE, libros_data, campos):
+            return True, f"Sincronización completada. {nuevos} libros nuevos agregados."
+        else:
+            return False, "Error al guardar los cambios en el servidor."
+    else:
+        return True, "No se encontraron nuevos libros para agregar."
 
 # ============================================================
 # FUNCIÓN PARA MOSTRAR FOTO
@@ -450,30 +378,300 @@ st.set_page_config(
 )
 
 # ============================================================
-# ESTILOS CSS
+# ESTILOS CSS - ESTILO SIMAK (minimalista, tonos tierra)
 # ============================================================
 st.markdown("""
 <style>
-    .stApp { background-color: #f5f0e8; }
-    h1, h2, h3 { font-family: 'Cormorant Garamond', serif; color: #2c2418; }
-    .book-entry { border-bottom: 1px solid #e0d6c8; padding: 1.5rem 0; }
-    .book-title { font-size: 1.5rem; font-weight: 600; cursor: pointer; }
-    .abstract { background-color: #faf8f4; padding: 1rem; border-left: 3px solid #c4b8a8; }
-    .footer { font-size: 0.7rem; text-align: center; margin-top: 3rem; }
+    /* Fondo general */
+    .stApp {
+        background-color: #f7f4eb;
+    }
+    
+    /* Tipografía */
+    h1, h2, h3, .stMarkdown {
+        font-family: 'Cormorant Garamond', 'Times New Roman', serif;
+        color: #3a3226;
+    }
+    
+    /* Títulos */
+    h1 {
+        font-size: 2.5rem;
+        font-weight: 400;
+        letter-spacing: 2px;
+        border-bottom: 1px solid #d4cdbc;
+        padding-bottom: 0.5rem;
+    }
+    
+    h2 {
+        font-size: 1.5rem;
+        font-weight: 400;
+        color: #5a4e3c;
+    }
+    
+    h3 {
+        font-size: 1.2rem;
+        font-weight: 400;
+        color: #7a6b55;
+    }
+    
+    /* Instrucción en negro intenso */
+    .instruction {
+        font-size: 0.7rem;
+        color: #1a1a1a;
+        margin-bottom: 1rem;
+        font-family: monospace;
+        letter-spacing: 0.5px;
+        font-weight: 500;
+    }
+    
+    /* Contenedor de libro */
+    .book-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.75rem 0;
+        border-bottom: 1px solid #e8e2d6;
+        gap: 1rem;
+    }
+    
+    /* Título del libro como enlace */
+    .book-title-link {
+        font-size: 1rem;
+        font-weight: 450;
+        color: #5a4e3c;
+        cursor: pointer;
+        text-decoration: none;
+        transition: color 0.2s ease;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    
+    .book-title-link:hover {
+        color: #8b7a62;
+        text-decoration: underline;
+    }
+    
+    /* Metadatos */
+    .book-meta {
+        font-size: 0.75rem;
+        color: #9b8e7a;
+        font-family: monospace;
+    }
+    
+    /* Contenedor de email y botón */
+    .book-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        flex-shrink: 0;
+    }
+    
+    /* Input de email minimalista */
+    .book-actions input {
+        background: transparent;
+        border: none;
+        border-bottom: 1px solid #d4cdbc;
+        padding: 0.4rem 0.2rem;
+        font-size: 0.8rem;
+        font-family: monospace;
+        width: 150px;
+        color: #3a3226;
+        outline: none;
+        transition: border-color 0.2s ease;
+    }
+    
+    .book-actions input:focus {
+        border-bottom-color: #a69b84;
+    }
+    
+    .book-actions input::placeholder {
+        color: #c4bbaa;
+        font-style: italic;
+    }
+    
+    /* Botón minimalista */
+    .minimal-btn {
+        background: transparent;
+        border: 1px solid #d4cdbc;
+        border-radius: 20px;
+        padding: 0.3rem 1rem;
+        font-size: 0.75rem;
+        font-family: monospace;
+        color: #7a6b55;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        white-space: nowrap;
+    }
+    
+    .minimal-btn:hover {
+        background-color: #f0ece4;
+        border-color: #a69b84;
+        color: #5a4e3c;
+    }
+    
+    /* Abstract */
+    .abstract {
+        background-color: #faf8f3;
+        padding: 1rem 1.2rem;
+        margin: 0.5rem 0 1rem 0;
+        border-left: 3px solid #c4bbaa;
+        font-size: 0.85rem;
+        line-height: 1.4;
+        color: #5a4e3c;
+        font-style: italic;
+    }
+    
+    /* Sidebar minimalista */
+    [data-testid="stSidebar"] {
+        background-color: #faf8f3;
+        border-right: 1px solid #e8e2d6;
+    }
+    
+    [data-testid="stSidebar"] .stRadio label {
+        font-family: monospace;
+        color: #7a6b55;
+        font-size: 0.8rem;
+    }
+    
+    /* Footer */
+    .footer {
+        font-size: 0.65rem;
+        text-align: center;
+        margin-top: 3rem;
+        padding-top: 1rem;
+        border-top: 1px solid #e8e2d6;
+        color: #b0a692;
+    }
+    
+    .footer a {
+        color: #8b7a62;
+        text-decoration: none;
+    }
+    
+    .footer a:hover {
+        text-decoration: underline;
+    }
+    
+    /* Mensajes */
+    .stAlert {
+        background-color: #faf8f3;
+        border-left: 3px solid;
+        font-family: monospace;
+        font-size: 0.8rem;
+    }
+    
+    /* Spinner */
+    .stSpinner > div {
+        border-color: #c4bbaa !important;
+    }
+    
+    /* Info box */
+    .stInfo {
+        background-color: #faf8f3;
+        font-family: monospace;
+    }
+    
+    /* Botones de Streamlit personalizados - estilo minimalista */
+    div[data-testid="column"] button {
+        background: transparent;
+        border: none;
+        color: #5a4e3c;
+        font-family: monospace;
+        font-size: 0.8rem;
+        text-align: left;
+        padding: 0.2rem 0;
+        transition: color 0.2s ease;
+    }
+    
+    div[data-testid="column"] button:hover {
+        color: #8b7a62;
+        background: transparent;
+        border: none;
+    }
+    
+    /* Botón Enviar específico */
+    button[key^="send_"] {
+        background: transparent;
+        border: 1px solid #d4cdbc;
+        border-radius: 20px;
+        padding: 0.2rem 0.8rem;
+        font-size: 0.7rem;
+        text-align: center;
+    }
+    
+    button[key^="send_"]:hover {
+        background-color: #f0ece4;
+        border-color: #a69b84;
+    }
+    
+    /* Botón de título */
+    button[key^="btn_"] {
+        font-weight: 500;
+        font-size: 0.95rem;
+        padding: 0;
+        margin: 0;
+    }
+    
+    /* Botón sincronizar */
+    button[key="sync_btn"] {
+        background: transparent;
+        border: 1px solid #d4cdbc;
+        border-radius: 20px;
+        padding: 0.3rem 1rem;
+        font-size: 0.75rem;
+        color: #7a6b55;
+    }
+    
+    button[key="sync_btn"]:hover {
+        background-color: #f0ece4;
+        border-color: #a69b84;
+        color: #5a4e3c;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================
 # INICIALIZACIÓN
 # ============================================================
-inicializar_csvs()
+def inicializar_csvs_remotos():
+    """Inicializa los archivos CSV en el servidor remoto si no existen"""
+    sftp = get_sftp()
+    if not sftp:
+        return
+    
+    libros_path = f"{REMOTE_CONFIG['remote_dir']}/{CSV_LIBROS_FILE}"
+    lecturas_path = f"{REMOTE_CONFIG['remote_dir']}/{CSV_LECTURAS_FILE}"
+    
+    try:
+        sftp.stat(libros_path)
+    except FileNotFoundError:
+        with sftp.open(libros_path, 'w') as f:
+            f.write('id,titulo,autor,año,archivo_pdf,abstract\n')
+    
+    try:
+        sftp.stat(lecturas_path)
+    except FileNotFoundError:
+        with sftp.open(lecturas_path, 'w') as f:
+            f.write('id_libro,email,fecha,ip,exito\n')
+    
+    sftp.close()
+
+try:
+    inicializar_csvs_remotos()
+except Exception as e:
+    st.error(f"Error al inicializar archivos remotos: {e}")
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
     st.markdown("### Navegación")
-    opcion = st.radio("Ir a:", ["Biblioteca", "Sobre el autor", "Admin"], label_visibility="collapsed")
+    opcion = st.radio(
+        "Ir a:", 
+        ["Biblioteca", "Sobre el autor", "Admin"], 
+        label_visibility="collapsed"
+    )
 
 # ============================================================
 # HEADER
@@ -489,54 +687,78 @@ if opcion == "Biblioteca":
     
     col1, col2 = st.columns([3, 1])
     with col2:
-        if st.button("🔄 Sincronizar con biblioteca remota"):
+        if st.button("⟳ Sincronizar", key="sync_btn"):
             with st.spinner("Sincronizando..."):
-                success, msg = sincronizar_libros_remotos()
+                success, msg = sincronizar_pdfs_a_csv()
                 if success:
                     st.success(msg)
+                    st.rerun()
                 else:
                     st.error(msg)
     
-    libros = cargar_libros_desde_csv()
+    libros = cargar_libros()
     
     if not libros:
-        st.info("No hay libros disponibles. Usa 'Sincronizar' para cargar los libros desde el servidor remoto.")
+        st.info("📭 No hay libros disponibles. Usa 'Sincronizar' para cargar los libros.")
     else:
-        # Mostrar cada libro una sola vez
+        # Instrucción en negro intenso para máximo contraste
+        st.markdown('<p class="instruction">⌵ Haz clic en el título para leer la sinopsis</p>', unsafe_allow_html=True)
+        
         for libro in libros:
             key_abstract = f"show_abstract_{libro['id']}"
             if key_abstract not in st.session_state:
                 st.session_state[key_abstract] = False
             
-            col_titulo, col_email = st.columns([2, 1])
+            # Una sola fila con todo
+            col_titulo, col_autor, col_stats, col_email, col_boton = st.columns([2.5, 1.2, 0.8, 1.5, 0.8])
             
             with col_titulo:
-                if st.button(libro['titulo'], key=f"btn_{libro['id']}"):
+                # Título clickeable
+                if st.button(
+                    libro['titulo'], 
+                    key=f"btn_{libro['id']}", 
+                    use_container_width=True
+                ):
                     st.session_state[key_abstract] = not st.session_state[key_abstract]
-                st.markdown(f"<small>{libro['autor']} · {libro['año']}</small>", unsafe_allow_html=True)
+            
+            with col_autor:
+                st.markdown(f'<span class="book-meta">{libro["autor"]}</span>', unsafe_allow_html=True)
+            
+            with col_stats:
                 num_descargas = obtener_estadisticas_libro(libro['id'])
-                st.markdown(f"<small>📊 {num_descargas} descargas</small>", unsafe_allow_html=True)
+                st.markdown(f'<span class="book-meta">📥 {num_descargas}</span>', unsafe_allow_html=True)
             
             with col_email:
-                email = st.text_input("Correo", key=f"email_{libro['id']}", placeholder="tu@email.com", label_visibility="collapsed")
-                if st.button("📧 Recibir PDF", key=f"enviar_{libro['id']}"):
-                    if email and "@" in email:
-                        if verificar_descarga_previa(libro['id'], email):
-                            st.warning("Ya has descargado este libro anteriormente. Revisa tu correo.")
+                email_input = st.text_input(
+                    "", 
+                    key=f"email_{libro['id']}", 
+                    placeholder="correo",
+                    label_visibility="collapsed"
+                )
+            
+            with col_boton:
+                if st.button("Enviar", key=f"send_{libro['id']}", use_container_width=True):
+                    if email_input and "@" in email_input and "." in email_input:
+                        if verificar_descarga_previa(libro['id'], email_input):
+                            st.warning("⚠️ Ya descargaste este libro")
                         else:
-                            with st.spinner("Enviando..."):
-                                success, msg = enviar_pdf_por_email(email, libro['id'], libro['archivo_pdf'], libro['titulo'])
+                            with st.spinner("📨"):
+                                success, msg = enviar_pdf_por_email(
+                                    email_input, 
+                                    libro['id'], 
+                                    libro['archivo_pdf'], 
+                                    libro['titulo']
+                                )
                                 if success:
                                     st.success(msg)
                                 else:
                                     st.error(msg)
                     else:
-                        st.warning("Por favor, ingresa un correo válido.")
+                        st.warning("📧 Correo válido requerido")
             
+            # Abstract debajo de la fila
             if st.session_state[key_abstract]:
-                st.markdown(f"<div class='abstract'>{libro['abstract']}</div>", unsafe_allow_html=True)
-            
-            st.markdown("<div class='book-entry'></div>", unsafe_allow_html=True)
+                st.markdown(f'<div class="abstract">📖 {libro["abstract"]}</div>', unsafe_allow_html=True)
 
 # ============================================================
 # SOBRE EL AUTOR
@@ -550,11 +772,28 @@ elif opcion == "Sobre el autor":
         with col1:
             st.image(foto, use_container_width=True)
         with col2:
-            st.markdown("### Escritor de ciencia ficción\n\nEscribo ciencia ficción porque creo que los mejores futuros posibles empiezan con preguntas incómodas en el presente.")
+            st.markdown("### ✍️ Carlos Polanco")
+            st.markdown("""
+            **Escritor de ciencia ficción**
+            
+            Escribo ciencia ficción porque creo que los mejores futuros posibles 
+            empiezan con preguntas incómodas en el presente.
+            
+            Mis relatos exploran la memoria, el tiempo y la conciencia humana.
+            """)
     else:
-        st.markdown("### Escritor de ciencia ficción\n\nEscribo ciencia ficción porque creo que los mejores futuros posibles empiezan con preguntas incómodas en el presente.")
+        st.markdown("### ✍️ Carlos Polanco")
+        st.markdown("""
+        **Escritor de ciencia ficción**
+        
+        Escribo ciencia ficción porque creo que los mejores futuros posibles 
+        empiezan con preguntas incómodas en el presente.
+        
+        Mis relatos exploran la memoria, el tiempo y la conciencia humana.
+        """)
     
-    st.markdown("---\n**Contacto:** [polanco@unam.mx](mailto:polanco@unam.mx)")
+    st.markdown("---")
+    st.markdown("**📧 Contacto:** [polanco@unam.mx](mailto:polanco@unam.mx)")
 
 # ============================================================
 # ADMIN
@@ -562,24 +801,36 @@ elif opcion == "Sobre el autor":
 elif opcion == "Admin":
     st.markdown("## Panel de administración")
     
-    tab1, tab2 = st.tabs(["📚 Libros", "📊 Descargas"])
+    tab1, tab2 = st.tabs(["📚 Catálogo", "📊 Descargas"])
     
     with tab1:
-        libros = cargar_libros_desde_csv()
-        st.write(f"**Total libros:** {len(libros)}")
-        for libro in libros:
-            st.markdown(f"- **ID {libro['id']}:** {libro['titulo']} - `{libro['archivo_pdf']}`")
+        libros = cargar_libros()
+        st.write(f"**Total de libros:** {len(libros)}")
+        st.markdown("---")
+        if libros:
+            for libro in libros:
+                with st.expander(f"📖 ID {libro['id']}: {libro['titulo']}"):
+                    st.markdown(f"**Autor:** {libro['autor']}")
+                    st.markdown(f"**Año:** {libro['año']}")
+                    st.markdown(f"**Archivo PDF:** `{libro['archivo_pdf']}`")
+                    st.markdown(f"**Descargas:** {obtener_estadisticas_libro(libro['id'])}")
+                    st.markdown("**Sinopsis:**")
+                    st.info(libro['abstract'][:500] + "..." if len(libro['abstract']) > 500 else libro['abstract'])
+        else:
+            st.info("📭 No hay libros en el catálogo.")
     
     with tab2:
         registros = obtener_todos_registros()
-        st.write(f"**Total descargas:** {len(registros)}")
+        st.write(f"**Total de descargas:** {len(registros)}")
+        st.markdown("---")
         if registros:
-            for reg in registros[-20:]:
-                st.markdown(f"- {reg['fecha']} - {reg['email']} - Libro ID: {reg['id_libro']}")
+            for reg in reversed(registros[-50:]):
+                estado = "✅" if reg.get('exito') == 'True' else "❌"
+                st.markdown(f"- {estado} **{reg['fecha']}** | 📧 {reg['email']} | 📚 Libro ID: {reg['id_libro']}")
         else:
-            st.info("No hay registros de descargas aún.")
+            st.info("📭 No hay registros de descargas aún.")
 
 # ============================================================
 # FOOTER
 # ============================================================
-st.markdown('<div class="footer">© 2026 · Biblioteca de Ciencia Ficción</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">© 2026 · Biblioteca de Ciencia Ficción · <a href="mailto:polanco@unam.mx">Contacto</a></div>', unsafe_allow_html=True)
