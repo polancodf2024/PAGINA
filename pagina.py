@@ -10,6 +10,7 @@ import csv
 import io
 import re
 from PIL import Image
+import os
 
 # ============================================================
 # CONFIGURACIÓN DESDE SECRETS
@@ -424,90 +425,11 @@ st.markdown("""
         font-weight: 500;
     }
     
-    /* Contenedor de libro */
-    .book-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 0.75rem 0;
-        border-bottom: 1px solid #e8e2d6;
-        gap: 1rem;
-    }
-    
-    /* Título del libro como enlace */
-    .book-title-link {
-        font-size: 1rem;
-        font-weight: 450;
-        color: #5a4e3c;
-        cursor: pointer;
-        text-decoration: none;
-        transition: color 0.2s ease;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-    
-    .book-title-link:hover {
-        color: #8b7a62;
-        text-decoration: underline;
-    }
-    
     /* Metadatos */
     .book-meta {
         font-size: 0.75rem;
         color: #9b8e7a;
         font-family: monospace;
-    }
-    
-    /* Contenedor de email y botón */
-    .book-actions {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        flex-shrink: 0;
-    }
-    
-    /* Input de email minimalista */
-    .book-actions input {
-        background: transparent;
-        border: none;
-        border-bottom: 1px solid #d4cdbc;
-        padding: 0.4rem 0.2rem;
-        font-size: 0.8rem;
-        font-family: monospace;
-        width: 150px;
-        color: #3a3226;
-        outline: none;
-        transition: border-color 0.2s ease;
-    }
-    
-    .book-actions input:focus {
-        border-bottom-color: #a69b84;
-    }
-    
-    .book-actions input::placeholder {
-        color: #c4bbaa;
-        font-style: italic;
-    }
-    
-    /* Botón minimalista */
-    .minimal-btn {
-        background: transparent;
-        border: 1px solid #d4cdbc;
-        border-radius: 20px;
-        padding: 0.3rem 1rem;
-        font-size: 0.75rem;
-        font-family: monospace;
-        color: #7a6b55;
-        cursor: pointer;
-        transition: all 0.2s ease;
-        white-space: nowrap;
-    }
-    
-    .minimal-btn:hover {
-        background-color: #f0ece4;
-        border-color: #a69b84;
-        color: #5a4e3c;
     }
     
     /* Abstract */
@@ -553,12 +475,48 @@ st.markdown("""
         text-decoration: underline;
     }
     
-    /* Mensajes */
+    /* Mensajes - ancho completo y mejor visualización */
     .stAlert {
-        background-color: #faf8f3;
-        border-left: 3px solid;
-        font-family: monospace;
-        font-size: 0.8rem;
+        width: 100% !important;
+        margin: 0.5rem 0 !important;
+        padding: 0.75rem 1rem !important;
+        border-radius: 4px !important;
+        font-family: monospace !important;
+        font-size: 0.85rem !important;
+        line-height: 1.4 !important;
+    }
+    
+    /* Asegurar que todos los mensajes ocupen todo el ancho */
+    div[data-testid="stAlert"] {
+        width: 100% !important;
+        min-width: 100% !important;
+    }
+    
+    /* Mensaje de éxito */
+    .stAlert[data-baseweb="alert"] {
+        background-color: #f0f4ec !important;
+        border-left: 3px solid #4caf50 !important;
+    }
+    
+    /* Mensaje de error */
+    .stAlert[data-baseweb="alert"][kind="error"] {
+        border-left: 3px solid #f44336 !important;
+    }
+    
+    /* Mensaje de advertencia */
+    .stAlert[data-baseweb="alert"][kind="warning"] {
+        border-left: 3px solid #ff9800 !important;
+    }
+    
+    /* Mensaje de información */
+    .stAlert[data-baseweb="alert"][kind="info"] {
+        border-left: 3px solid #2196f3 !important;
+    }
+    
+    /* Contenedor de mensajes global */
+    .stMarkdown .stAlert, 
+    div:has(> .stAlert) {
+        width: 100% !important;
     }
     
     /* Spinner */
@@ -570,9 +528,10 @@ st.markdown("""
     .stInfo {
         background-color: #faf8f3;
         font-family: monospace;
+        width: 100%;
     }
     
-    /* Botones de Streamlit personalizados - estilo minimalista */
+    /* Botones de Streamlit personalizados */
     div[data-testid="column"] button {
         background: transparent;
         border: none;
@@ -701,7 +660,7 @@ if opcion == "Biblioteca":
     if not libros:
         st.info("📭 No hay libros disponibles. Usa 'Sincronizar' para cargar los libros.")
     else:
-        # Instrucción en negro intenso para máximo contraste
+        # Instrucción en negro intenso
         st.markdown('<p class="instruction">⌵ Haz clic en el título para leer la sinopsis</p>', unsafe_allow_html=True)
         
         for libro in libros:
@@ -709,56 +668,74 @@ if opcion == "Biblioteca":
             if key_abstract not in st.session_state:
                 st.session_state[key_abstract] = False
             
-            # Una sola fila con todo
-            col_titulo, col_autor, col_stats, col_email, col_boton = st.columns([2.5, 1.2, 0.8, 1.5, 0.8])
-            
-            with col_titulo:
-                # Título clickeable
-                if st.button(
-                    libro['titulo'], 
-                    key=f"btn_{libro['id']}", 
-                    use_container_width=True
-                ):
-                    st.session_state[key_abstract] = not st.session_state[key_abstract]
-            
-            with col_autor:
-                st.markdown(f'<span class="book-meta">{libro["autor"]}</span>', unsafe_allow_html=True)
-            
-            with col_stats:
-                num_descargas = obtener_estadisticas_libro(libro['id'])
-                st.markdown(f'<span class="book-meta">📥 {num_descargas}</span>', unsafe_allow_html=True)
-            
-            with col_email:
-                email_input = st.text_input(
-                    "", 
-                    key=f"email_{libro['id']}", 
-                    placeholder="correo",
-                    label_visibility="collapsed"
-                )
-            
-            with col_boton:
-                if st.button("Enviar", key=f"send_{libro['id']}", use_container_width=True):
-                    if email_input and "@" in email_input and "." in email_input:
-                        if verificar_descarga_previa(libro['id'], email_input):
-                            st.warning("⚠️ Ya descargaste este libro")
+            # Crear un contenedor para la fila del libro
+            with st.container():
+                col_titulo, col_autor, col_stats, col_email, col_boton = st.columns([2.5, 1.2, 0.8, 1.5, 0.8])
+                
+                with col_titulo:
+                    if st.button(
+                        libro['titulo'], 
+                        key=f"btn_{libro['id']}", 
+                        use_container_width=True
+                    ):
+                        st.session_state[key_abstract] = not st.session_state[key_abstract]
+                
+                with col_autor:
+                    st.markdown(f'<span class="book-meta">{libro["autor"]}</span>', unsafe_allow_html=True)
+                
+                with col_stats:
+                    num_descargas = obtener_estadisticas_libro(libro['id'])
+                    st.markdown(f'<span class="book-meta">📥 {num_descargas}</span>', unsafe_allow_html=True)
+                
+                with col_email:
+                    email_input = st.text_input(
+                        "", 
+                        key=f"email_{libro['id']}", 
+                        placeholder="correo",
+                        label_visibility="collapsed"
+                    )
+                
+                with col_boton:
+                    if st.button("Enviar", key=f"send_{libro['id']}", use_container_width=True):
+                        # Validar email y procesar envío
+                        if email_input and "@" in email_input and "." in email_input:
+                            if verificar_descarga_previa(libro['id'], email_input):
+                                # Usar placeholder fuera de las columnas
+                                st.session_state[f'warning_{libro["id"]}'] = "⚠️ Ya descargaste este libro anteriormente"
+                                st.session_state[f'error_{libro["id"]}'] = None
+                                st.session_state[f'success_{libro["id"]}'] = None
+                            else:
+                                with st.spinner("📨 Enviando..."):
+                                    success, msg = enviar_pdf_por_email(
+                                        email_input, 
+                                        libro['id'], 
+                                        libro['archivo_pdf'], 
+                                        libro['titulo']
+                                    )
+                                    if success:
+                                        st.session_state[f'success_{libro["id"]}'] = msg
+                                        st.session_state[f'error_{libro["id"]}'] = None
+                                        st.session_state[f'warning_{libro["id"]}'] = None
+                                    else:
+                                        st.session_state[f'error_{libro["id"]}'] = msg
+                                        st.session_state[f'success_{libro["id"]}'] = None
+                                        st.session_state[f'warning_{libro["id"]}'] = None
                         else:
-                            with st.spinner("📨"):
-                                success, msg = enviar_pdf_por_email(
-                                    email_input, 
-                                    libro['id'], 
-                                    libro['archivo_pdf'], 
-                                    libro['titulo']
-                                )
-                                if success:
-                                    st.success(msg)
-                                else:
-                                    st.error(msg)
-                    else:
-                        st.warning("📧 Correo válido requerido")
-            
-            # Abstract debajo de la fila
-            if st.session_state[key_abstract]:
-                st.markdown(f'<div class="abstract">📖 {libro["abstract"]}</div>', unsafe_allow_html=True)
+                            st.session_state[f'warning_{libro["id"]}'] = "📧 Por favor, ingresa un correo electrónico válido"
+                            st.session_state[f'error_{libro["id"]}'] = None
+                            st.session_state[f'success_{libro["id"]}'] = None
+                
+                # Mostrar mensajes fuera de las columnas (a ancho completo)
+                if st.session_state.get(f'success_{libro["id"]}'):
+                    st.success(st.session_state[f'success_{libro["id"]}'])
+                if st.session_state.get(f'error_{libro["id"]}'):
+                    st.error(st.session_state[f'error_{libro["id"]}'])
+                if st.session_state.get(f'warning_{libro["id"]}'):
+                    st.warning(st.session_state[f'warning_{libro["id"]}'])
+                
+                # Abstract debajo de la fila
+                if st.session_state[key_abstract]:
+                    st.markdown(f'<div class="abstract">📖 {libro["abstract"]}</div>', unsafe_allow_html=True)
 
 # ============================================================
 # SOBRE EL AUTOR
